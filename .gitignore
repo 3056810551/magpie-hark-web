@@ -2,4 +2,10 @@ node_modules/
 *.log
 *.log.*
 run-*/
+accounts.json
+engine.key
 .DS_Store
+.env*
+test/diag*.mjs
+test/test-*.mjs
+test-diag*/

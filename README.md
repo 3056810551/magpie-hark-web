@@ -103,6 +103,6 @@ Hark 网页本身没有开放函数调用接口，插件采用提示词映射机
 - `HARK_WEB_ENGINE_PORT`：自定义本地引擎监听端口（默认 `18622`）
 - `HARK_WEB_CHROME`：指定 Chrome 可执行文件路径
 - `HARK_WEB_CHROME_PORT`：指定已运行 Chrome 的 CDP 调试端口
-- `HARK_WEB_BROWSER`：浏览器运行模式，可选 `headless`（默认后台无头）、`hidden`（隐藏窗口）、`show`（显示窗口）
+- `HARK_WEB_BROWSER`：浏览器运行模式，可选 `hidden`（默认后台隐藏窗口，推荐）、`headless`（无头模式）、`show`（显示窗口）
 - `HARK_WEB_PROXY`：指定代理地址（如 `http://127.0.0.1:7890`，或设为 `direct` 直连）
 - `HARK_WEB_IDLE_MIN`：闲置多长时间自动释放后台浏览器进程以节省内存（默认 60 分钟）
