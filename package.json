@@ -1,0 +1,41 @@
+{
+  "name": "magpie-hark-web",
+  "version": "0.1.0",
+  "description": "Magpie provider plugin for hark.com: sign in to each account in a browser window or connect to existing Chrome, use Hark in Codex, OpenCode and other agents, with tool calls and usage card",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "engine/",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test contract.test.mjs \"test/*.test.mjs\""
+  },
+  "keywords": [
+    "magpie",
+    "magpie-plugin",
+    "opencode",
+    "opencode-plugin",
+    "hark",
+    "hark-web",
+    "hark-com"
+  ],
+  "author": "Antigravity Assistant",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "magpie": {
+    "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+CiAgPGRlZnM+CiAgICA8bGluZWFyR3JhZGllbnQgaWQ9ImciIHgxPSIwIiB5MT0iMCIgeDI9IjEiIHkyPSIxIj4KICAgICAgPHN0b3Agb2Zmc2V0PSIwJSIgc3RvcC1jb2xvcj0iIzFFMjkzQiIvPgogICAgICA8c3RvcCBvZmZzZXQ9IjEwMCUiIHN0b3AtY29sb3I9IiMwRjE3MkEiLz4KICAgIDwvbGluZWFyR3JhZGllbnQ+CiAgICA8bGluZWFyR3JhZGllbnQgaWQ9ImFjY2VudCIgeDE9IjAiIHkxPSIwIiB4Mj0iMSIgeTI9IjEiPgogICAgICA8c3RvcCBvZmZzZXQ9IjAlIiBzdG9wLWNvbG9yPSIjMzhCREY4Ii8+CiAgICAgIDxzdG9wIG9mZnNldD0iMTAwJSIgc3RvcC1jb2xvcj0iIzgxOENGOCIvPgogICAgPC9saW5lYXJHcmFkaWVudD4KICA8L2RlZnM+CiAgPHJlY3Qgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByeD0iMTYiIGZpbGw9InVybCgjZykiLz4KICA8IS0tIFN0eWxpemVkIEhhcmsgYmlyZCAvIHNvdW5kIGNyZXN0IC0tPgogIDxwYXRoIGQ9Ik0xOCA0NlYxOGg4djExaDEyVjE4aDh2MjhoLThWMzVIMjZ2MTF6IiBmaWxsPSJ1cmwoI2FjY2VudCkiLz4KICA8Y2lyY2xlIGN4PSI0OCIgY3k9IjE4IiByPSIzLjUiIGZpbGw9IiMzOEJERjgiLz4KPC9zdmc+Cg==",
+    "maxConcurrency": 1
+  }
+}
