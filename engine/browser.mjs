@@ -25,7 +25,7 @@ export function browserCandidates(platform = process.platform, env = process.env
       ["Chromium", "Application", "chrome.exe"],
       ["BraveSoftware", "Brave-Browser", "Application", "brave.exe"],
     ]
-    return rels.flatMap((root) => roots.map((root) => path.win32.join(root, ...rel)))
+    return rels.flatMap((rel) => roots.map((root) => path.win32.join(root, ...rel)))
   }
   const names = ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "microsoft-edge", "microsoft-edge-stable", "brave-browser"]
   const dirs = (env.PATH || "/usr/bin:/usr/local/bin").split(path.delimiter).concat(["/usr/bin", "/snap/bin", "/opt/google/chrome"])
