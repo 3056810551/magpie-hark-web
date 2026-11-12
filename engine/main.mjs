@@ -30,7 +30,7 @@ const site = (env.HARK_WEB_SITE || "https://hark.com").replace(/\/+$/, "")
 const proxy = resolveProxy(env)
 const fetchImpl = proxiedFetch(proxy)
 const executable = findBrowser(env)
-const mode = ["headless", "hidden", "show"].includes(env.HARK_WEB_BROWSER) ? env.HARK_WEB_BROWSER : "headless"
+const mode = ["headless", "hidden", "show"].includes(env.HARK_WEB_BROWSER) ? env.HARK_WEB_BROWSER : "hidden"
 const idleMs = (Number(env.HARK_WEB_IDLE_MIN) || 60) * 60_000
 const verifyLogin = env.HARK_WEB_VERIFY_LOGIN !== "0"
 const connectPort = env.HARK_WEB_CHROME_PORT ? Number(env.HARK_WEB_CHROME_PORT) : null

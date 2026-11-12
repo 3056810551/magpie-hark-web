@@ -175,22 +175,42 @@ const POLL_JS = `(function(){
   if (!list) return JSON.stringify({ cnt: 0, txt: '', streaming: false, done: false });
   
   var entries = Array.from(list.querySelectorAll('[data-entry-kind="message"]'));
-  var botEntries = entries.filter(function(e) {
-    return !!e.querySelector('._151xtfxi') || !!e.querySelector('._151xtfxf') || !e.querySelector('._151xtfxe');
-  });
+  
+  // Find the latest user message in the list
+  var lastUserIdx = -1;
+  for (var i = entries.length - 1; i >= 0; i--) {
+    if (entries[i].querySelector('._151xtfxe')) {
+      lastUserIdx = i;
+      break;
+    }
+  }
+  
+  // Only look for bot messages AFTER the latest user message
+  var botEntries = [];
+  if (lastUserIdx !== -1) {
+    for (var j = lastUserIdx + 1; j < entries.length; j++) {
+      var isBot = !!entries[j].querySelector('._151xtfxi') || !!entries[j].querySelector('._151xtfxf') || !entries[j].querySelector('._151xtfxe');
+      if (isBot) botEntries.push(entries[j]);
+    }
+  } else {
+    botEntries = entries.filter(function(e) {
+      return !!e.querySelector('._151xtfxi') || !!e.querySelector('._151xtfxf');
+    });
+  }
   
   var lastBot = botEntries.length ? botEntries[botEntries.length - 1] : null;
   var bubble = lastBot ? lastBot.querySelector('[data-testid="message-bubble"]') : null;
   var textEl = lastBot ? (lastBot.querySelector('[data-testid="message-text"]') || lastBot) : null;
   
   var kind = bubble ? (bubble.getAttribute('data-bubble-kind') || '') : '';
-  var streaming = kind === 'streaming';
+  var streaming = kind === 'streaming' || (!lastBot && lastUserIdx !== -1);
   var txt = textEl ? (textEl.innerText || '').trim() : '';
   
   var sendBtn = document.querySelector('[data-testid="send-button"]');
+  var aria = sendBtn ? (sendBtn.getAttribute('aria-label') || '') : '';
   var btnBusy = sendBtn ? (sendBtn.getAttribute('aria-busy') === 'true' || sendBtn.disabled) : false;
   
-  var done = (!streaming && kind === 'text' && !btnBusy) || (txt.length > 0 && !streaming && !btnBusy);
+  var done = !!(lastBot && !streaming && (kind === 'text' || (aria === '开始听写' && txt.length > 0) || (!btnBusy && txt.length > 0)));
   
   return JSON.stringify({
     cnt: botEntries.length,
@@ -201,16 +221,11 @@ const POLL_JS = `(function(){
   });
 })()`
 
-const NOTICE_JS = `(function(){
-  var t = document.body ? (document.body.innerText || '') : '';
-  document.querySelectorAll('[data-testid="message-bubble"]').forEach(function(b){
-    var s = (b.innerText || '').trim(); if (s) t = t.split(s).join(' ');
-  });
-  return t.slice(-1500);
+const SIGNED_OUT_CHECK_JS = `(function(){
+  if (window.location.pathname.startsWith('/login') || window.location.pathname.startsWith('/sign-in')) return true;
+  if (!document.querySelector('textarea') && !document.querySelector('[data-testid="message-list"]')) return true;
+  return false;
 })()`
-
-const QUOTA_SPENT = /已用完使用额度|额度不足|积分不足|达到上限|out of credits|usage limit|reached your limit|token limit/i
-const SIGNED_OUT = /log in|sign in|create an account|登录|use another account/i
 const ZERO_WIDTH = /[\u200b-\u200d\u2060\ufeff]/g
 const UNSETTLED_TAIL = /(^|\n)[ \t]*(?:[-*+>#]+|\d+[.)]|`{1,3})?[ \t]*$/
 
@@ -362,22 +377,34 @@ export class Hark {
     if (a.home && !a.home.page.closed) return a.home
 
     const { targetId } = await browser.send("Target.createTarget", {
-      url: `${this.site}/chat`,
+      url: "about:blank",
       browserContextId: a.contextId,
-      background: true,
     })
     const page = await CDP.connect(`ws://127.0.0.1:${port}/devtools/page/${targetId}`, { timeoutMs: 180_000 })
     await Promise.all([
       page.send("Page.enable"),
       page.send("Runtime.enable"),
       page.send("Network.enable"),
+      page.send("Page.bringToFront"),
     ])
 
+    await page.send("Page.navigate", { url: `${this.site}/chat` })
+
     const startWait = Date.now()
+    let ready = false
     while (Date.now() - startWait < this.loadMs) {
       const state = await page.js(READY_JS).catch(() => "")
-      if (state === "ready") break
-      await sleep(250)
+      if (state === "ready") {
+        ready = true
+        break
+      }
+      await sleep(500)
+    }
+
+    if (!ready) {
+      const isSignedOut = await page.js(SIGNED_OUT_CHECK_JS).catch(() => false)
+      if (isSignedOut) throw new AuthError("检测到未登录状态，需要重新登录")
+      throw new GenerationError("Hark 页面加载超时（输入框未就绪）")
     }
 
     a.home = { page, targetId }
@@ -407,18 +434,25 @@ export class Hark {
       const { page } = await this.ensurePage(account)
       if (signal?.aborted) throw new Error("aborted")
 
-      // Check signed out or quota
-      const notice = await page.js(NOTICE_JS).catch(() => "")
-      if (SIGNED_OUT.test(notice)) throw new AuthError("检测到未登录状态，需要重新登录")
-      if (QUOTA_SPENT.test(notice)) throw new QuotaError("Hark 账号额度已用完")
+      // Check signed out
+      const isSignedOut = await page.js(SIGNED_OUT_CHECK_JS).catch(() => false)
+      if (isSignedOut) throw new AuthError("检测到未登录状态，需要重新登录")
 
       // Inject text into textarea
       await page.js(SETTER_JS(prompt))
-      await sleep(100)
+      await sleep(200)
 
       // Click send button
-      const clicked = await page.js(SEND_BUTTON_JS)
-      if (clicked === "disabled" || clicked === "no-button") {
+      let clicked = false
+      for (let i = 0; i < 15; i++) {
+        const c = await page.js(SEND_BUTTON_JS)
+        if (c === "clicked") {
+          clicked = true
+          break
+        }
+        await sleep(150)
+      }
+      if (!clicked) {
         // Fallback: send Enter key
         for (const type of ["keyDown", "keyUp"]) {
           await page.send("Input.dispatchKeyEvent", {
@@ -457,9 +491,8 @@ export class Hark {
             onChunk?.(s.delta)
           }
         } else if (!firstTokenReceived && Date.now() - start > this.firstTokenMs) {
-          const checkNotice = await page.js(NOTICE_JS).catch(() => "")
-          if (QUOTA_SPENT.test(checkNotice)) throw new QuotaError("Hark 账号额度已用完")
-          if (SIGNED_OUT.test(checkNotice)) throw new AuthError("Hark 登录已失效")
+          const isSignedOut = await page.js(SIGNED_OUT_CHECK_JS).catch(() => false)
+          if (isSignedOut) throw new AuthError("Hark 登录已失效")
           throw new GenerationError("Hark 首字响应超时")
         }
 

@@ -68,6 +68,7 @@ export function browserArgs({ port, profileDir, headless, hidden = false, proxy,
     "--proxy-bypass-list=<-loopback>",
     "--use-mock-keychain",
     "--password-store=basic",
+    "--disable-blink-features=AutomationControlled",
   ]
   if (headless) args.push("--headless=new", "--disable-gpu")
   else {
