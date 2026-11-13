@@ -45,6 +45,12 @@ function listen() {
         res.end(payload)
         return
       }
+      if (req.url === "/v1/import") {
+        const payload = JSON.stringify({ ok: true, account: { handle: "hark-imported-1", expires: 1800000000000, label: "Cookie User" } })
+        res.writeHead(200, { "content-type": "application/json", "content-length": Buffer.byteLength(payload) })
+        res.end(payload)
+        return
+      }
       if (req.url === "/v1/usage") {
         const payload = JSON.stringify(mode === "card"
           ? { plan: "Hark Pro · 已就绪", windows: [{ name: "每日 Token", used: 10 }], user: "杨剑华", until: "2026-12-12T11:29:41.000Z" }
@@ -204,6 +210,55 @@ test("config registers provider and models", async () => {
     assert.ok(cfg.provider["hark-web"])
     assert.ok(cfg.provider["hark-web"].models.hark)
     assert.equal(cfg.provider["hark-web"].models.hark.tool_call, true)
+  } finally {
+    await env.close()
+  }
+})
+
+test("cookie string key imports once and caches resolved handle across requests", async () => {
+  const env = await boot()
+  try {
+    const cookieKey = "__Secure-hark.session_token=raw-tok; hark_region=US"
+    const cookieAuth = async () => ({ type: "api", key: cookieKey })
+    const loader = await env.hooks.auth.loader(cookieAuth)
+
+    await loader.fetch(env.url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "hark", stream: false, messages: [{ role: "user", content: "hi" }] }),
+    })
+    await loader.fetch(env.url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "hark", stream: false, messages: [{ role: "user", content: "hi again" }] }),
+    })
+    await env.hooks.auth.usage(cookieAuth)
+
+    const imports = env.seen.filter((r) => r.url === "/v1/import")
+    const chats = env.seen.filter((r) => r.url === "/v1/chat/completions")
+    const usages = env.seen.filter((r) => r.url === "/v1/usage")
+    assert.equal(imports.length, 1)
+    assert.equal(chats.length, 2)
+    assert.equal(usages.length, 1)
+    assert.equal(chats[0].account, "hark-imported-1")
+    assert.equal(chats[1].account, "hark-imported-1")
+    assert.equal(usages[0].account, "hark-imported-1")
+
+    // On 401, cached handle invalidates so a subsequent call can re-import
+    await env.setMode("401")
+    const expired = await loader.fetch(env.url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "hark", stream: false, messages: [{ role: "user", content: "expired" }] }),
+    })
+    assert.equal(expired.status, 401)
+    await env.setMode("ok")
+    await loader.fetch(env.url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "hark", stream: false, messages: [{ role: "user", content: "reimport" }] }),
+    })
+    assert.equal(env.seen.filter((r) => r.url === "/v1/import").length, 2)
   } finally {
     await env.close()
   }

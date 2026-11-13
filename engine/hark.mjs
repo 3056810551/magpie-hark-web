@@ -44,51 +44,110 @@ export function expiryMs(exp) {
   return vals.length ? Math.min(...vals) * 1000 : Date.now() + 30 * 86_400_000
 }
 
-export async function renewSession(site, cookies, expires, { fetchImpl = fetch } = {}) {
-  let cur = { ...(cookies || {}) }
-  const exp = { ...(expires || {}) }
-  const headers = {
-    "user-agent": UA,
-    origin: site,
-    referer: `${site}/chat`,
-    "sec-fetch-site": "same-origin",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-dest": "empty",
-    cookie: cookieHeader(cur),
-  }
-  let res
-  try {
-    res = await fetchImpl(`${site}/api/auth/get-session`, { headers, redirect: "manual", signal: AbortSignal.timeout(12_000) })
-  } catch (err) {
-    throw new GenerationError(`/api/auth/get-session 网络请求失败 (${err?.name || "Error"})；请检查网络或代理`)
-  }
-  if (res.status === 401) throw new AuthError("会话认证失败 (/api/auth/get-session HTTP 401)，需要重新登录")
-  if (res.status !== 200) {
-    throw new GenerationError(`/api/auth/get-session HTTP ${res.status}：上游请求未成功`)
-  }
-  let body
-  try {
-    body = await res.json()
-  } catch {
-    throw new GenerationError("/api/auth/get-session 返回的不是 JSON；会话状态未确认")
-  }
-  if (!body || !body.user) {
-    throw new GenerationError("/api/auth/get-session 没有返回有效会话；请在官网检查账号状态")
-  }
-  const set = parseSetCookies(typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [])
-  cur = { ...cur, ...set.cookies }
-  Object.assign(exp, set.exp)
+const SESSION_IN_PAGE_JS = `fetch('/api/auth/get-session', { credentials: 'include' })
+  .then(async function(r) {
+    var body = null;
+    try { body = await r.json(); } catch {}
+    return { status: r.status, body: body };
+  })
+  .catch(function() { return null; })`
+
+function buildSessionResult(body, cookies, exp) {
   const user = body.user || {}
   const session = body.session || {}
   const label = user.name ? `${user.name}${user.email ? ` (${user.email})` : ""}` : (user.email || user.id || "Hark 用户")
   const expAt = session.expiresAt ? Date.parse(session.expiresAt) : expiryMs(exp)
   return {
-    cookies: cur,
+    cookies,
     cookies_exp: exp,
     label,
     userId: user.id || "",
     expiresAt: Number.isFinite(expAt) ? expAt : Date.now() + 30 * 86_400_000,
   }
+}
+
+export async function renewSession(site, cookies, expires, { fetchImpl = fetch, getPage = null } = {}) {
+  const baseSite = String(site || "https://hark.com").replace(/\/+$/, "")
+  const host = new URL(baseSite).hostname
+  let cur = { ...(cookies || {}) }
+  const exp = { ...(expires || {}) }
+  const headers = {
+    "user-agent": UA,
+    origin: baseSite,
+    referer: `${baseSite}/chat`,
+    "sec-fetch-site": "same-origin",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-dest": "empty",
+    cookie: cookieHeader(cur),
+  }
+
+  let primaryErr = null
+  let res = null
+  try {
+    res = await fetchImpl(`${baseSite}/api/auth/get-session`, { headers, redirect: "manual", signal: AbortSignal.timeout(12_000) })
+  } catch (err) {
+    primaryErr = new GenerationError(`/api/auth/get-session 网络请求失败 (${err?.name || "Error"})；请检查网络或代理`)
+  }
+
+  if (res) {
+    if (res.status === 401) throw new AuthError("会话认证失败 (/api/auth/get-session HTTP 401)，需要重新登录")
+    if (res.status !== 200) {
+      primaryErr = new GenerationError(`/api/auth/get-session HTTP ${res.status}：上游请求未成功`)
+    } else {
+      let body
+      try {
+        body = await res.json()
+      } catch {
+        primaryErr = new GenerationError("/api/auth/get-session 返回的不是 JSON；会话状态未确认")
+      }
+      if (!primaryErr) {
+        if (!body || !body.user) {
+          primaryErr = new GenerationError("/api/auth/get-session 没有返回有效会话；请在官网检查账号状态")
+        } else {
+          const set = parseSetCookies(typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [])
+          cur = { ...cur, ...set.cookies }
+          Object.assign(exp, set.exp)
+          return buildSessionResult(body, cur, exp)
+        }
+      }
+    }
+  }
+
+  if (typeof getPage === "function") {
+    let acquired = null
+    try {
+      acquired = await getPage()
+    } catch (err) {
+      if (err instanceof AuthError) throw err
+    }
+    const page = acquired?.page || (acquired && typeof acquired.js === "function" ? acquired : null)
+    const release = acquired?.release || null
+    try {
+      if (page && !page.closed) {
+        const pRes = await page.js(SESSION_IN_PAGE_JS, { awaitPromise: true, timeoutMs: 10_000 }).catch(() => null)
+        if (pRes) {
+          if (pRes.status === 401 || (pRes.status === 200 && !pRes.body?.user)) {
+            throw new AuthError("会话认证失败 (/api/auth/get-session)，需要重新登录")
+          }
+          if (pRes.status === 200 && pRes.body?.user) {
+            const cookieRes = await page.send("Network.getCookies", { urls: [baseSite] }).catch(() => ({ cookies: [] }))
+            const sorted = [...(cookieRes.cookies || [])].sort((a, b) => (a.domain === host ? 1 : 0) - (b.domain === host ? 1 : 0))
+            for (const c of sorted) {
+              if (c.name && c.value) {
+                cur[c.name] = c.value
+                if (Number.isFinite(c.expires) && c.expires > 0) exp[c.name] = c.expires
+              }
+            }
+            return buildSessionResult(pRes.body, cur, exp)
+          }
+        }
+      }
+    } finally {
+      await release?.()
+    }
+  }
+
+  throw primaryErr || new GenerationError("/api/auth/get-session 请求失败")
 }
 
 export async function fetchBillingSummary(site, cookies, { fetchImpl = fetch } = {}) {
@@ -483,17 +542,38 @@ export class Hark {
   async setCookies(browser, contextId, cookies, expires) {
     const now = Date.now() / 1000
     const secure = this.site.startsWith("https:")
+    const list = []
     for (const [name, value] of Object.entries(cookies || {})) {
       if (!value) continue
       const e = Number(expires?.[name])
       const at = Number.isFinite(e) && e > now + 3600 ? e : now + 30 * 86400
-      for (const domain of [`.${this.host}`, this.host]) {
+      list.push({ name, value, url: this.site, path: "/", secure, expires: at })
+    }
+    if (!list.length) return
+    await browser.send("Storage.setCookies", {
+      ...(contextId ? { browserContextId: contextId } : {}),
+      cookies: list,
+    }).catch(async () => {
+      for (const c of list) {
         await browser.send("Storage.setCookies", {
           ...(contextId ? { browserContextId: contextId } : {}),
-          cookies: [{ name, value, domain, path: "/", secure, expires: at }],
+          cookies: [c],
         }).catch(() => {})
       }
-    }
+    })
+  }
+
+  async renewAccount(account) {
+    return await renewSession(this.site, account.cookies, account.cookies_exp, {
+      fetchImpl: this.fetchImpl,
+      getPage: async () => {
+        const a = this.accounts.get(account.id)
+        if (a?.home?.page && !a.home.page.closed) return { page: a.home.page }
+        if (a?.busy) return null
+        const home = await this.ensurePage(account)
+        return home?.page ? { page: home.page } : null
+      },
+    })
   }
 
   async readSessionInPage(page) {
@@ -511,7 +591,8 @@ export class Hark {
       const cookies = { ...(account.cookies || {}) }
       const exp = { ...(account.cookies_exp || {}) }
       let changed = false
-      for (const c of res.cookies || []) {
+      const sorted = [...(res.cookies || [])].sort((a, b) => (a.domain === this.host ? 1 : 0) - (b.domain === this.host ? 1 : 0))
+      for (const c of sorted) {
         if (c.name && c.value && cookies[c.name] !== c.value) {
           cookies[c.name] = c.value
           if (Number.isFinite(c.expires) && c.expires > 0) exp[c.name] = c.expires

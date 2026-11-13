@@ -195,7 +195,9 @@ export function createServer({
     const acct = account(req)
     meta.account = acct.id
     try {
-      const renewed = await renewSession(site, acct.cookies, acct.cookies_exp, { fetchImpl: hark.fetchImpl })
+      const renewed = typeof hark.renewAccount === "function"
+        ? await hark.renewAccount(acct)
+        : await renewSession(site, acct.cookies, acct.cookies_exp, { fetchImpl: hark.fetchImpl })
       store.update(acct.id, renewed.cookies, renewed.cookies_exp, renewed.userId)
       json(res, 200, { expires: expiryMs(renewed.cookies_exp) })
     } catch (err) {
@@ -250,19 +252,24 @@ export function createServer({
       const id = await logins.start()
       json(res, 200, { id, url: `http://127.0.0.1:${port}/login/${id}` })
     },
-    "POST /v1/import": async (req, res) => {
+    "POST /v1/import": async (req, res, meta) => {
       authorize(req)
       const payload = await body(req)
+      let saved
       try {
-        const saved = await importSession({
+        saved = await importSession({
           cookieString: payload.cookieString,
           cdpPort: payload.cdpPort,
           site,
+          store,
+          fetchImpl: hark.fetchImpl,
         })
-        json(res, 200, { ok: true, account: saved })
       } catch (err) {
         throw new HttpError(400, err.message)
       }
+      meta.account = saved.handle
+      if (saved.changed) await hark.closeAccount?.(saved.handle).catch(() => {})
+      json(res, 200, { ok: true, account: saved })
     },
   }
 

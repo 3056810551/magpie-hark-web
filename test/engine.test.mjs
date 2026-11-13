@@ -10,7 +10,8 @@ import { devToolsActivePortCandidates, findExistingBrowser, parseDevToolsActiveP
 import { CDP } from "../engine/cdp.mjs"
 import { buildPrompt } from "../engine/prompt.mjs"
 import { functions, parseCalls, toolsPrompt } from "../engine/tools.mjs"
-import { HARK_MAX_CHARS, POLL_JS, expiryMs, fitWithinLimit, parseSetCookies, settle, splitForInput, usageCard } from "../engine/hark.mjs"
+import { AuthError, HARK_MAX_CHARS, Hark, POLL_JS, expiryMs, fitWithinLimit, parseSetCookies, renewSession, settle, splitForInput, usageCard } from "../engine/hark.mjs"
+import { createServer } from "../engine/server.mjs"
 import { dataDir, engineKey, writePrivate } from "../engine/paths.mjs"
 import { Store, parseCookieString } from "../engine/store.mjs"
 import { VERSION } from "../engine/version.mjs"
@@ -400,4 +401,244 @@ test("hark: splitForInput and fitWithinLimit keep composer text below 40k limit"
   const fitted = fitWithinLimit(full, "写一段代码", 1000)
   assert.ok(fitted.length <= 1000)
   assert.ok(fitted.includes("写一段代码"))
+})
+
+test("store: sync reloads external writes to accounts.json", () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), "hark-store-sync-"))
+  const file = path.join(tmpDir, "accounts.json")
+  try {
+    const serverStore = new Store(file)
+    assert.equal(serverStore.count(), 0)
+
+    const cliStore = new Store(file)
+    const saved = cliStore.add({ "__Secure-hark.session_token": "tok-cli" }, { "__Secure-hark.session_token": 1800000000 }, "CLI User", "uid-cli")
+
+    assert.equal(serverStore.count(), 1)
+    const loaded = serverStore.get(saved.handle)
+    assert.ok(loaded)
+    assert.equal(loaded.cookies["__Secure-hark.session_token"], "tok-cli")
+    assert.equal(loaded.userId, "uid-cli")
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true })
+  }
+})
+
+test("server: POST /v1/import syncs live store and closes stale account on re-import", async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), "hark-srv-import-"))
+  const closedAccounts = []
+  let tokenCounter = 0
+
+  const upstream = http.createServer((req, res) => {
+    if (req.url === "/api/auth/get-session") {
+      tokenCounter++
+      const body = JSON.stringify({
+        user: { id: "uid-shared", name: "Tester", email: "tester@example.com" },
+        session: { expiresAt: "2030-01-01T00:00:00.000Z" },
+      })
+      res.writeHead(200, { "content-type": "application/json" })
+      res.end(body)
+      return
+    }
+    res.writeHead(404)
+    res.end()
+  })
+
+  await new Promise((r) => upstream.listen(0, "127.0.0.1", r))
+  const site = `http://127.0.0.1:${upstream.address().port}`
+  const store = new Store(path.join(tmpDir, "accounts.json"))
+  const hark = {
+    fetchImpl: fetch,
+    usageOf: () => ({ at: Date.now(), plan: "Hark Pro", windows: [] }),
+    readUsage: async () => ({ at: Date.now(), plan: "Hark Pro", windows: [] }),
+    closeAccount: async (id) => { closedAccounts.push(id) },
+    chatStream: async (acct, _prompt, { onChunk }) => {
+      onChunk(`acct:${acct.cookies["__Secure-hark.session_token"]}`)
+      return `acct:${acct.cookies["__Secure-hark.session_token"]}`
+    },
+  }
+  const server = createServer({
+    hark,
+    logins: { start: async () => "id", get: () => null },
+    store,
+    key: "test-key",
+    site,
+  })
+  await new Promise((r) => server.listen(0, "127.0.0.1", r))
+  const base = `http://127.0.0.1:${server.address().port}`
+
+  try {
+    const imp1 = await fetch(`${base}/v1/import`, {
+      method: "POST",
+      headers: { authorization: "Bearer test-key", "content-type": "application/json" },
+      body: JSON.stringify({ cookieString: "__Secure-hark.session_token=tok-1" }),
+    })
+    assert.equal(imp1.status, 200)
+    const body1 = await imp1.json()
+    assert.equal(body1.ok, true)
+    const handle = body1.account.handle
+    assert.ok(handle.startsWith("hark-"))
+    assert.equal(closedAccounts.length, 0)
+
+    // Immediately usable via in-memory store on next request without engine restart
+    const chatRes = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer test-key",
+        "x-hark-account": handle,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: "hark", stream: false, messages: [{ role: "user", content: "hi" }] }),
+    })
+    assert.equal(chatRes.status, 200)
+    const chatBody = await chatRes.json()
+    assert.equal(chatBody.choices[0].message.content, "acct:tok-1")
+
+    // Re-importing identical cookies keeps the open account alive without closing it
+    const impSame = await fetch(`${base}/v1/import`, {
+      method: "POST",
+      headers: { authorization: "Bearer test-key", "content-type": "application/json" },
+      body: JSON.stringify({ cookieString: "__Secure-hark.session_token=tok-1" }),
+    })
+    assert.equal(impSame.status, 200)
+    const bodySame = await impSame.json()
+    assert.equal(bodySame.account.handle, handle)
+    assert.equal(bodySame.account.again, true)
+    assert.equal(bodySame.account.changed, false)
+    assert.deepEqual(closedAccounts, [])
+
+    // Re-importing changed cookies for same userId closes stale browser account state and updates cookies
+    const imp2 = await fetch(`${base}/v1/import`, {
+      method: "POST",
+      headers: { authorization: "Bearer test-key", "content-type": "application/json" },
+      body: JSON.stringify({ cookieString: "__Secure-hark.session_token=tok-2" }),
+    })
+    assert.equal(imp2.status, 200)
+    const body2 = await imp2.json()
+    assert.equal(body2.account.handle, handle)
+    assert.equal(body2.account.again, true)
+    assert.equal(body2.account.changed, true)
+    assert.deepEqual(closedAccounts, [handle])
+    assert.equal(store.get(handle).cookies["__Secure-hark.session_token"], "tok-2")
+    assert.equal(tokenCounter, 3)
+  } finally {
+    await new Promise((r) => server.close(r))
+    await new Promise((r) => upstream.close(r))
+    rmSync(tmpDir, { recursive: true, force: true })
+  }
+})
+
+test("renewSession: falls back to in-page fetch on Cloudflare 403 and fails fast on 401", async () => {
+  let released = false
+  let fallbackCalled = 0
+
+  // 1) Cloudflare 403 on direct fetch -> page fallback succeeds & prefers exact-host cookie
+  const renewed = await renewSession(
+    "https://hark.com",
+    { "__Secure-hark.session_token": "old-tok" },
+    {},
+    {
+      fetchImpl: async () => new Response("Cloudflare 403", { status: 403 }),
+      getPage: async () => ({
+        page: {
+          closed: false,
+          js: async () => ({
+            status: 200,
+            body: {
+              user: { id: "u-cf", name: "CF User", email: "cf@example.com" },
+              session: { expiresAt: "2030-05-01T00:00:00.000Z" },
+            },
+          }),
+          send: async (method) => {
+            if (method === "Network.getCookies") {
+              return {
+                cookies: [
+                  { name: "__Secure-hark.session_token", value: "exact-host-tok", domain: "hark.com", expires: 1900000000 },
+                  { name: "__Secure-hark.session_token", value: "stale-dot-tok", domain: ".hark.com", expires: 1800000000 },
+                ],
+              }
+            }
+            return {}
+          },
+        },
+        release: () => { released = true },
+      }),
+    },
+  )
+  assert.equal(released, true)
+  assert.equal(renewed.userId, "u-cf")
+  assert.equal(renewed.cookies["__Secure-hark.session_token"], "exact-host-tok")
+
+  // 2) Direct HTTP 401 -> AuthError without touching page fallback
+  await assert.rejects(
+    () => renewSession(
+      "https://hark.com",
+      { "__Secure-hark.session_token": "bad" },
+      {},
+      {
+        fetchImpl: async () => new Response('{"error":"unauthorized"}', { status: 401 }),
+        getPage: async () => { fallbackCalled++; return null },
+      },
+    ),
+    AuthError,
+  )
+  assert.equal(fallbackCalled, 0)
+
+  // 3) Direct 403 + in-page 401 -> AuthError
+  await assert.rejects(
+    () => renewSession(
+      "https://hark.com",
+      { "__Secure-hark.session_token": "expired" },
+      {},
+      {
+        fetchImpl: async () => new Response("Cloudflare 403", { status: 403 }),
+        getPage: async () => ({
+          page: { closed: false, js: async () => ({ status: 401, body: null }) },
+        }),
+      },
+    ),
+    AuthError,
+  )
+})
+
+test("hark: setCookies writes once per cookie via url (no dual-domain entries) and renewAccount uses open page fallback", async () => {
+  const sent = []
+  const fakeBrowser = {
+    send: async (method, params) => {
+      sent.push({ method, params })
+      return {}
+    },
+  }
+  const hark = new Hark({
+    site: "https://hark.com",
+    fetchImpl: async () => new Response("cf blocked", { status: 403 }),
+  })
+  await hark.setCookies(fakeBrowser, "ctx-1", {
+    "__Secure-hark.session_token": "tok-abc",
+    "__Host-csrf": "csrf-123",
+  }, {})
+
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0].method, "Storage.setCookies")
+  assert.equal(sent[0].params.browserContextId, "ctx-1")
+  assert.equal(sent[0].params.cookies.length, 2)
+  assert.deepEqual(sent[0].params.cookies.map((c) => c.name), ["__Secure-hark.session_token", "__Host-csrf"])
+  for (const c of sent[0].params.cookies) {
+    assert.equal(c.url, "https://hark.com")
+    assert.equal("domain" in c, false)
+  }
+
+  // renewAccount falls back to already open a.home.page when HTTP fetch returns 403
+  hark.acct("acct-1").home = {
+    page: {
+      closed: false,
+      js: async () => ({
+        status: 200,
+        body: { user: { id: "u-1", name: "Alice" }, session: { expiresAt: "2031-01-01T00:00:00.000Z" } },
+      }),
+      send: async () => ({ cookies: [{ name: "__Secure-hark.session_token", value: "tok-fresh", domain: "hark.com", expires: 1950000000 }] }),
+    },
+  }
+  const res = await hark.renewAccount({ id: "acct-1", cookies: { "__Secure-hark.session_token": "tok-old" }, cookies_exp: {} })
+  assert.equal(res.userId, "u-1")
+  assert.equal(res.cookies["__Secure-hark.session_token"], "tok-fresh")
 })

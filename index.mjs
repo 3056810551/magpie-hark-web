@@ -176,6 +176,27 @@ export const HarkWebPlugin = async (_input, options) => {
 
   if (!external()) ensureEngine().catch(() => {})
 
+  const importedHandles = new Map()
+  const importingHandles = new Map()
+  async function resolveHandle(raw) {
+    if (!raw || !(raw.includes("=") || raw.includes(";"))) return raw
+    if (importedHandles.has(raw)) return importedHandles.get(raw)
+    if (importingHandles.has(raw)) return importingHandles.get(raw)
+    const pending = (async () => {
+      const imp = await control("/v1/import", "POST", "", { cookieString: raw })
+      if (imp?.ok) {
+        const body = await imp.json().catch(() => null)
+        if (body?.account?.handle) {
+          importedHandles.set(raw, body.account.handle)
+          return body.account.handle
+        }
+      }
+      return raw
+    })().finally(() => importingHandles.delete(raw))
+    importingHandles.set(raw, pending)
+    return pending
+  }
+
   return {
     config: async (cfg) => {
       cfg.provider ??= {}
@@ -219,11 +240,15 @@ export const HarkWebPlugin = async (_input, options) => {
         { type: "api", label: "账号 ID 或 Cookie（高级/导入）", placeholder: "hark-xxxxxxxxxxxx 或粘贴 Cookie" },
       ],
       async refresh(auth) {
-        const handle = handleOf(auth)
-        if (!handle) throw Object.assign(new Error("hark-web account has no engine handle"), { signIn: "expired" })
+        const rawHandle = handleOf(auth)
+        if (!rawHandle) throw Object.assign(new Error("hark-web account has no engine handle"), { signIn: "expired" })
+        const handle = await resolveHandle(rawHandle)
         const res = await control("/v1/session/refresh", "POST", handle)
         if (!res) throw new Error("engine unreachable")
-        if (res.status === 401) throw Object.assign(new Error("session refused"), { signIn: "expired" })
+        if (res.status === 401) {
+          if (handle !== rawHandle) importedHandles.delete(rawHandle)
+          throw Object.assign(new Error("session refused"), { signIn: "expired" })
+        }
         if (!res.ok) throw new Error("session refresh unavailable")
         const body = await res.json()
         if (typeof body.expires !== "number" || !Number.isFinite(body.expires)) {
@@ -232,21 +257,16 @@ export const HarkWebPlugin = async (_input, options) => {
         return auth?.type === "oauth" ? { access: handle, refresh: handle, expires: body.expires } : { expires: body.expires }
       },
       async usage(getAuth) {
-        let handle = handleOf(await getAuth())
-        if (!handle) return { error: "hark-web account has no engine handle", signIn: "expired" }
-
-        // If user pasted a cookie string directly as the API key, try auto-importing it
-        if (handle.includes("=") || handle.includes(";")) {
-          const imp = await control("/v1/import", "POST", "", { cookieString: handle })
-          if (imp?.ok) {
-            const body = await imp.json()
-            if (body?.account?.handle) handle = body.account.handle
-          }
-        }
+        const rawHandle = handleOf(await getAuth())
+        if (!rawHandle) return { error: "hark-web account has no engine handle", signIn: "expired" }
+        const handle = await resolveHandle(rawHandle)
 
         const res = await control("/v1/usage", "GET", handle)
         if (!res) return { error: "engine unreachable" }
-        if (res.status === 401) return { error: "session refused", signIn: "expired" }
+        if (res.status === 401) {
+          if (handle !== rawHandle) importedHandles.delete(rawHandle)
+          return { error: "session refused", signIn: "expired" }
+        }
         let body = {}
         try {
           body = await res.json()
@@ -269,16 +289,9 @@ export const HarkWebPlugin = async (_input, options) => {
           baseURL: engineBaseURL(),
           async fetch(input, init) {
             const auth = await getAuth()
-            let handle = handleOf(auth)
-            if (!handle) throw Object.assign(new Error("hark-web account has no engine handle"), { signIn: "expired" })
-
-            if (handle.includes("=") || handle.includes(";")) {
-              const imp = await control("/v1/import", "POST", "", { cookieString: handle })
-              if (imp?.ok) {
-                const body = await imp.json()
-                if (body?.account?.handle) handle = body.account.handle
-              }
-            }
+            const rawHandle = handleOf(auth)
+            if (!rawHandle) throw Object.assign(new Error("hark-web account has no engine handle"), { signIn: "expired" })
+            const handle = await resolveHandle(rawHandle)
 
             const incoming = new Headers(init?.headers)
             const send = async () => {
@@ -299,8 +312,10 @@ export const HarkWebPlugin = async (_input, options) => {
             }
             const out = new Headers(res.headers)
             out.delete("content-length")
-            if (res.status === 401) out.set("x-magpie-sign-in", "expired")
-            else if (res.ok) out.set("x-magpie-sign-in", "kept")
+            if (res.status === 401) {
+              if (handle !== rawHandle) importedHandles.delete(rawHandle)
+              out.set("x-magpie-sign-in", "expired")
+            } else if (res.ok) out.set("x-magpie-sign-in", "kept")
             return new Response(res.body, { status: res.status, statusText: res.statusText, headers: out })
           },
         }

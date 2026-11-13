@@ -1,5 +1,5 @@
 // Accounts kept by the engine: handle → {cookies, cookies_exp, label, userId, created}.
-import { existsSync, readFileSync } from "node:fs"
+import { existsSync, readFileSync, statSync } from "node:fs"
 import { randomBytes } from "node:crypto"
 import { expiryMs } from "./hark.mjs"
 import { writePrivate } from "./paths.mjs"
@@ -28,15 +28,32 @@ export class Store {
   constructor(file) {
     this.file = file
     this.accounts = {}
-    if (existsSync(file)) {
+    this.stamp = ""
+    this.load()
+  }
+
+  fileStamp() {
+    const st = statSync(this.file, { throwIfNoEntry: false })
+    return st ? `${st.mtimeMs}:${st.size}` : ""
+  }
+
+  load() {
+    if (existsSync(this.file)) {
       try {
-        const raw = JSON.parse(readFileSync(file, "utf8"))
+        const raw = JSON.parse(readFileSync(this.file, "utf8"))
         if (raw && typeof raw === "object" && !Array.isArray(raw)) this.accounts = raw
       } catch {}
     }
+    this.stamp = this.fileStamp()
+  }
+
+  sync() {
+    const cur = this.fileStamp()
+    if (cur && cur !== this.stamp) this.load()
   }
 
   get(handle) {
+    this.sync()
     const item = this.accounts[handle]
     return item?.cookies ? {
       id: handle,
@@ -49,29 +66,35 @@ export class Store {
   }
 
   handles() {
+    this.sync()
     return Object.keys(this.accounts)
   }
 
   count() {
+    this.sync()
     return Object.keys(this.accounts).length
   }
 
   save() {
     writePrivate(this.file, JSON.stringify(this.accounts, null, 2) + "\n")
+    this.stamp = this.fileStamp()
   }
 
   add(cookies, exp = {}, label = "", userId = "") {
+    this.sync()
     const known = userId && Object.keys(this.accounts).find((h) => this.accounts[h].userId === userId)
     if (known) {
+      const prev = this.accounts[known]
+      const changed = Object.entries(cookies || {}).some(([k, v]) => v && prev.cookies?.[k] !== v)
       this.accounts[known] = {
-        ...this.accounts[known],
-        cookies,
-        cookies_exp: exp || {},
+        ...prev,
+        cookies: changed ? cookies : { ...(prev.cookies || {}), ...cookies },
+        cookies_exp: changed ? (exp || {}) : { ...(prev.cookies_exp || {}), ...(exp || {}) },
         ...(label ? { label } : {}),
         userId,
       }
-      this.save()
-      return { handle: known, expires: expiryMs(exp), label: this.accounts[known].label, again: true }
+      if (changed || (label && label !== prev.label)) this.save()
+      return { handle: known, expires: expiryMs(this.accounts[known].cookies_exp), label: this.accounts[known].label, again: true, changed }
     }
     const handle = `hark-${randomBytes(6).toString("hex")}`
     const created = Date.now()
@@ -82,6 +105,7 @@ export class Store {
   }
 
   update(handle, cookies, exp = {}, userId = "") {
+    this.sync()
     if (!this.accounts[handle]) return
     this.accounts[handle] = {
       ...this.accounts[handle],
@@ -93,6 +117,7 @@ export class Store {
   }
 
   remove(handle) {
+    this.sync()
     if (!this.accounts[handle]) return
     delete this.accounts[handle]
     this.save()

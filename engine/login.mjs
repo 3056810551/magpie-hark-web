@@ -104,7 +104,17 @@ export class Logins {
         const got = await this.cookies(opened.browser)
         if (ESSENTIAL.every((n) => got.cookies[n])) {
           run.step = "正在向 Hark 确认会话"
-          const renewed = await renewSession(this.site, got.cookies, got.exp, { fetchImpl: this.fetchImpl })
+          const renewed = await renewSession(this.site, got.cookies, got.exp, {
+            fetchImpl: this.fetchImpl,
+            getPage: async () => {
+              const { targetInfos } = await opened.browser.send("Target.getTargets").catch(() => ({ targetInfos: [] }))
+              const tgt = (targetInfos || []).find((t) => t.type === "page" && String(t.url || "").startsWith(this.site))
+              if (!tgt) return null
+              const ses = await opened.browser.attach(tgt.targetId, { timeoutMs: 15_000 })
+              await ses.send("Network.enable").catch(() => {})
+              return { page: ses, release: () => ses.close() }
+            },
+          })
           close()
           run.step = "已确认会话，正在保存账号"
           try {
