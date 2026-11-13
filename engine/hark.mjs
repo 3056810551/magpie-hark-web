@@ -160,64 +160,90 @@ const SEND_BUTTON_JS = `(function(){
     });
   if (!btn) return 'no-button';
   if (btn.disabled) return 'disabled';
+  var aria = btn.getAttribute('aria-label') || '';
+  if (/听写|dictat|voice|mic/i.test(aria)) return 'not-ready';
   btn.click();
   return 'clicked';
 })()`
 
-const POLL_JS = `(function(){
+const SNAPSHOT_JS = `(function(){
+  var list = document.querySelector('[data-testid="message-list"]');
+  if (!list) return JSON.stringify([]);
+  var ids = [];
+  var els = list.querySelectorAll('[data-bubble-id]');
+  for (var i = 0; i < els.length; i++) {
+    var id = els[i].getAttribute('data-bubble-id');
+    if (id) ids.push(id);
+  }
+  return JSON.stringify(ids);
+})()`
+
+export const POLL_JS = (seenIds = []) => `(function(seenList){
   var scroller = document.querySelector('[data-testid="message-list"]') || document.body;
   if (scroller && scroller.scrollHeight > scroller.clientHeight + 40) {
     scroller.scrollTop = scroller.scrollHeight;
   }
   var list = document.querySelector('[data-testid="message-list"]');
-  if (!list) return JSON.stringify({ cnt: 0, txt: '', streaming: false, done: false });
-  
+  if (!list) return JSON.stringify({ cnt: 0, txt: '', streaming: true, hasUser: false });
+
+  var seen = Object.create(null);
+  for (var s = 0; s < seenList.length; s++) seen[seenList[s]] = true;
+
   var entries = Array.from(list.querySelectorAll('[data-entry-kind="message"]'));
-  
-  // Find the latest user message in the list
-  var lastUserIdx = -1;
-  for (var i = entries.length - 1; i >= 0; i--) {
-    if (entries[i].querySelector('._151xtfxe')) {
-      lastUserIdx = i;
+
+  // Find the first newly mounted user message (bubble ID not in pre-send snapshot).
+  var newUserIdx = -1;
+  for (var i = 0; i < entries.length; i++) {
+    var bubbleEl = entries[i].querySelector('[data-testid="message-bubble"]');
+    var bid = bubbleEl ? bubbleEl.getAttribute('data-bubble-id') : '';
+    var isNewId = bid && !seen[bid];
+    var isUserEl = !!entries[i].querySelector('._151xtfxe');
+    if (isNewId && (isUserEl || !entries[i].querySelector('._151xtfxi, ._151xtfxf'))) {
+      newUserIdx = i;
       break;
     }
   }
-  
-  // Only look for bot messages AFTER the latest user message
-  var botEntries = [];
-  if (lastUserIdx !== -1) {
-    for (var j = lastUserIdx + 1; j < entries.length; j++) {
-      var isBot = !!entries[j].querySelector('._151xtfxi') || !!entries[j].querySelector('._151xtfxf') || !entries[j].querySelector('._151xtfxe');
-      if (isBot) botEntries.push(entries[j]);
-    }
-  } else {
-    botEntries = entries.filter(function(e) {
-      return !!e.querySelector('._151xtfxi') || !!e.querySelector('._151xtfxf');
-    });
+
+  if (newUserIdx === -1) {
+    return JSON.stringify({ cnt: 0, txt: '', streaming: true, hasUser: false });
   }
-  
-  var lastBot = botEntries.length ? botEntries[botEntries.length - 1] : null;
-  var bubble = lastBot ? lastBot.querySelector('[data-testid="message-bubble"]') : null;
-  var textEl = lastBot ? (lastBot.querySelector('[data-testid="message-text"]') || lastBot) : null;
-  
-  var kind = bubble ? (bubble.getAttribute('data-bubble-kind') || '') : '';
-  var streaming = kind === 'streaming' || (!lastBot && lastUserIdx !== -1);
-  var txt = textEl ? (textEl.innerText || '').trim() : '';
-  
+
+  // Gather ALL assistant entries after the new user message (handles intro text + code cards).
+  var botEntries = [];
+  for (var j = newUserIdx + 1; j < entries.length; j++) {
+    if (entries[j].querySelector('._151xtfxe')) break;
+    botEntries.push(entries[j]);
+  }
+
+  if (!botEntries.length) {
+    return JSON.stringify({ cnt: 0, txt: '', streaming: true, hasUser: true });
+  }
+
+  var parts = [];
+  var anyStreamingBubble = false;
+  for (var k = 0; k < botEntries.length; k++) {
+    var e = botEntries[k];
+    var b = e.querySelector('[data-testid="message-bubble"]');
+    var kind = b ? (b.getAttribute('data-bubble-kind') || '') : '';
+    if (kind === 'streaming') anyStreamingBubble = true;
+    var textEl = e.querySelector('[data-testid="message-text"]') || e;
+    var t = textEl ? (textEl.innerText || '').trim() : '';
+    if (t) parts.push(t);
+  }
+
+  var txt = parts.join('\\n\\n');
   var sendBtn = document.querySelector('[data-testid="send-button"]');
-  var aria = sendBtn ? (sendBtn.getAttribute('aria-label') || '') : '';
   var btnBusy = sendBtn ? (sendBtn.getAttribute('aria-busy') === 'true' || sendBtn.disabled) : false;
-  
-  var done = !!(lastBot && !streaming && (kind === 'text' || (aria === '开始听写' && txt.length > 0) || (!btnBusy && txt.length > 0)));
-  
+  var stopBtn = document.querySelector('[data-testid="stop-button"], button[aria-label*="Stop"], button[aria-label*="停止"]');
+  var streaming = anyStreamingBubble || !!stopBtn || btnBusy;
+
   return JSON.stringify({
     cnt: botEntries.length,
     txt: txt,
     streaming: streaming,
-    done: done,
-    kind: kind
+    hasUser: true
   });
-})()`
+})(${JSON.stringify(seenIds)})`
 
 const SIGNED_OUT_CHECK_JS = `(function(){
   if (window.location.pathname.startsWith('/login') || window.location.pathname.startsWith('/sign-in')) return true;
@@ -563,6 +589,14 @@ export class Hark {
       const isSignedOut = await page.js(SIGNED_OUT_CHECK_JS).catch(() => false)
       if (isSignedOut) throw new AuthError("检测到未登录状态，需要重新登录")
 
+      // Snapshot existing bubble IDs before sending so previous turns never leak into this response
+      let seenIds = []
+      try {
+        const snap = await page.js(SNAPSHOT_JS).catch(() => "[]")
+        const parsed = JSON.parse(snap)
+        if (Array.isArray(parsed)) seenIds = parsed
+      } catch {}
+
       // Inject text into textarea
       await page.js(SETTER_JS(prompt))
       await sleep(200)
@@ -591,6 +625,9 @@ export class Hark {
       }
 
       let sent = ""
+      let lastTxt = ""
+      let stableCount = 0
+      const STABLE_POLLS = 6
       const start = Date.now()
       let firstTokenReceived = false
 
@@ -598,7 +635,7 @@ export class Hark {
         if (signal?.aborted) throw new Error("aborted")
         await sleep(250)
 
-        const raw = await page.js(POLL_JS).catch(() => null)
+        const raw = await page.js(POLL_JS(seenIds)).catch(() => null)
         if (!raw) continue
 
         let poll
@@ -610,22 +647,29 @@ export class Hark {
 
         if (poll.txt) {
           if (!firstTokenReceived) firstTokenReceived = true
-          const s = settle(sent, poll.txt, poll.done)
+          if (poll.txt !== lastTxt) {
+            lastTxt = poll.txt
+            stableCount = 0
+          } else if (!poll.streaming) {
+            stableCount++
+          } else {
+            stableCount = 0
+          }
+
+          const final = !poll.streaming && stableCount >= STABLE_POLLS
+          const s = settle(sent, poll.txt, final)
           if (s.delta) {
             sent = s.sent
             onChunk?.(s.delta)
           }
-        } else if (!firstTokenReceived && Date.now() - start > this.firstTokenMs) {
-          const isSignedOut = await page.js(SIGNED_OUT_CHECK_JS).catch(() => false)
-          if (isSignedOut) throw new AuthError("Hark 登录已失效")
-          throw new GenerationError("Hark 首字响应超时")
-        }
-
-        if (poll.done) {
-          // Send any remaining tail
-          const s = settle(sent, poll.txt, true)
-          if (s.delta) onChunk?.(s.delta)
-          break
+          if (final) break
+        } else {
+          stableCount = 0
+          if (!firstTokenReceived && Date.now() - start > this.firstTokenMs) {
+            const isSignedOut = await page.js(SIGNED_OUT_CHECK_JS).catch(() => false)
+            if (isSignedOut) throw new AuthError("Hark 登录已失效")
+            throw new GenerationError("Hark 首字响应超时")
+          }
         }
       }
 

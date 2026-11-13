@@ -1,6 +1,6 @@
 {
   "name": "magpie-hark-web",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Magpie provider plugin for hark.com: sign in to each account in a browser window or connect to existing Chrome, use Hark in Codex, OpenCode and other agents, with tool calls and usage card",
   "type": "module",
   "main": "./index.mjs",

@@ -10,7 +10,7 @@ import { devToolsActivePortCandidates, findExistingBrowser, parseDevToolsActiveP
 import { CDP } from "../engine/cdp.mjs"
 import { buildPrompt } from "../engine/prompt.mjs"
 import { functions, parseCalls, toolsPrompt } from "../engine/tools.mjs"
-import { expiryMs, parseSetCookies, settle, usageCard } from "../engine/hark.mjs"
+import { POLL_JS, expiryMs, parseSetCookies, settle, usageCard } from "../engine/hark.mjs"
 import { dataDir, engineKey, writePrivate } from "../engine/paths.mjs"
 import { Store, parseCookieString } from "../engine/store.mjs"
 import { VERSION } from "../engine/version.mjs"
@@ -316,4 +316,70 @@ test("browser: findExistingBrowser connects via DevToolsActivePort when /json/ve
     await mock.close()
     rmSync(tmpDir, { recursive: true, force: true })
   }
+})
+
+test("hark: POLL_JS ignores prior-turn OK and joins multi-entry text + code card", () => {
+  const makeEntry = ({ id = null, user = false, bot = false, kind = "text", text = "" }) => {
+    const bubble = id ? { getAttribute: (k) => (k === "data-bubble-id" ? id : k === "data-bubble-kind" ? kind : null) } : null
+    return {
+      innerText: text,
+      querySelector: (sel) => {
+        if (sel === '[data-testid="message-bubble"]') return bubble
+        if (sel === "._151xtfxe") return user ? {} : null
+        if (sel === "._151xtfxi, ._151xtfxf") return bot ? {} : null
+        if (sel === '[data-testid="message-text"]') return id ? { innerText: text } : null
+        return null
+      },
+    }
+  }
+
+  const runPoll = (entries, seenIds, { stop = false } = {}) => {
+    const list = {
+      scrollHeight: 100,
+      clientHeight: 100,
+      scrollTop: 0,
+      querySelectorAll: (sel) => {
+        if (sel === '[data-entry-kind="message"]') return entries
+        return []
+      },
+    }
+    const doc = {
+      body: list,
+      querySelector: (sel) => {
+        if (sel === '[data-testid="message-list"]') return list
+        if (sel === '[data-testid="send-button"]') return { getAttribute: () => "false", disabled: false }
+        if (sel.includes("stop-button")) return stop ? {} : null
+        return null
+      },
+    }
+    return JSON.parse(new Function("document", `return ${POLL_JS(seenIds)}`)(doc))
+  }
+
+  const oldEntries = [
+    makeEntry({ id: "u1", user: true, text: "Reply with just: OK" }),
+    makeEntry({ id: "b1", bot: true, kind: "text", text: "OK" }),
+  ]
+
+  // Before new user message mounts in DOM, must NOT leak old "OK"
+  const beforeMount = runPoll(oldEntries, ["u1", "b1"])
+  assert.equal(beforeMount.hasUser, false)
+  assert.equal(beforeMount.txt, "")
+  assert.equal(beforeMount.streaming, true)
+
+  // New user prompt + intro text bubble + code card (no bubble id) while streaming
+  const fullEntries = [
+    ...oldEntries,
+    makeEntry({ id: "u2", user: true, text: "写一段langchain的基础代码" }),
+    makeEntry({ id: "b2", bot: true, kind: "text", text: "这是基础示例：" }),
+    makeEntry({ id: null, text: "LangChain\nfrom langchain_openai import ChatOpenAI" }),
+  ]
+  const mid = runPoll(fullEntries, ["u1", "b1"], { stop: true })
+  assert.equal(mid.hasUser, true)
+  assert.equal(mid.cnt, 2)
+  assert.equal(mid.streaming, true)
+  assert.equal(mid.txt, "这是基础示例：\n\nLangChain\nfrom langchain_openai import ChatOpenAI")
+
+  const done = runPoll(fullEntries, ["u1", "b1"], { stop: false })
+  assert.equal(done.streaming, false)
+  assert.equal(done.txt, "这是基础示例：\n\nLangChain\nfrom langchain_openai import ChatOpenAI")
 })
