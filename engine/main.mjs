@@ -34,6 +34,7 @@ const mode = ["headless", "hidden", "show"].includes(env.HARK_WEB_BROWSER) ? env
 const idleMs = (Number(env.HARK_WEB_IDLE_MIN) || 60) * 60_000
 const verifyLogin = env.HARK_WEB_VERIFY_LOGIN !== "0"
 const connectPort = env.HARK_WEB_CHROME_PORT ? Number(env.HARK_WEB_CHROME_PORT) : null
+const autoConnect = env.HARK_WEB_REUSE_CHROME !== "0"
 
 const store = new Store(path.join(dir, "accounts.json"))
 const hark = new Hark({
@@ -44,9 +45,12 @@ const hark = new Hark({
   hidden: mode === "hidden",
   proxy,
   connectPort,
+  autoConnect,
   fetchImpl,
   onCookies: (id, cookies, exp, userId) => store.update(id, cookies, exp, userId),
+  onConnect: (b) => log(`${new Date().toTimeString().slice(0, 8)} ${b.existing ? `reusing existing Chrome (${b.source})` : `launched Chrome (${mode})`}`),
   onLost: (why) => log(`${new Date().toTimeString().slice(0, 8)} browser lost (${why}) — a new one starts with next request`),
+  onLog: (msg) => log(`${new Date().toTimeString().slice(0, 8)} ${msg}`),
 })
 
 const logins = new Logins({
@@ -118,7 +122,7 @@ server.on("error", async (err) => {
 server.listen(port, "127.0.0.1", () => {
   log(
     `hark-web engine ${VERSION} listening on http://127.0.0.1:${port} · ${store.count()} accounts · ` +
-      `browser ${connectPort ? `CDP port ${connectPort}` : executable ? `${path.basename(executable)} (${mode})` : "not found"} · proxy ${masked(proxy)} · data ${dir}`,
+      `browser ${connectPort ? `CDP port ${connectPort}` : autoConnect ? `reuse Chrome if enabled / ${executable ? `${path.basename(executable)} (${mode})` : "not found"}` : executable ? `${path.basename(executable)} (${mode})` : "not found"} · proxy ${masked(proxy)} · data ${dir}`,
   )
 })
 

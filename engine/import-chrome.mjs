@@ -3,12 +3,14 @@ import path from "node:path"
 import { dataDir } from "./paths.mjs"
 import { Store, parseCookieString } from "./store.mjs"
 import { renewSession } from "./hark.mjs"
-import { CDP, httpJSON } from "./cdp.mjs"
+import { findExistingBrowser } from "./browser.mjs"
 
-export async function importFromCDP(port = 9222, site = "https://hark.com") {
-  const version = await httpJSON(`http://127.0.0.1:${port}/json/version`, 3000)
-  if (!version?.webSocketDebuggerUrl) throw new Error(`No Chrome debugging port reachable at 127.0.0.1:${port}`)
-  const browser = await CDP.connect(version.webSocketDebuggerUrl)
+export async function importFromCDP(port, site = "https://hark.com") {
+  const found = await findExistingBrowser({ connectPort: port })
+  if (!found) {
+    throw new Error(port ? `No Chrome debugging port reachable at 127.0.0.1:${port}` : "未检测到可复用的 Chrome 远程调试端口")
+  }
+  const { browser, source } = found
   try {
     const list = await browser.send("Storage.getCookies").catch(() => ({ cookies: [] }))
     const cookies = {}
@@ -21,7 +23,7 @@ export async function importFromCDP(port = 9222, site = "https://hark.com") {
       }
     }
     if (!cookies["__Secure-hark.session_token"]) {
-      throw new Error(`Chrome 在 127.0.0.1:${port} 上没有找到 Hark 的登录会话 (__Secure-hark.session_token)`)
+      throw new Error(`Chrome (${source}) 上没有找到 Hark 的登录会话 (__Secure-hark.session_token)`)
     }
     return { cookies, exp }
   } finally {
@@ -36,11 +38,10 @@ export async function importSession({ cookieString, cdpPort, site = "https://har
   } else if (cdpPort) {
     sessionData = await importFromCDP(cdpPort, site)
   } else {
-    // Try probing common debug ports 9222
     try {
-      sessionData = await importFromCDP(9222, site)
+      sessionData = await importFromCDP(undefined, site)
     } catch {
-      throw new Error("请提供 Cookie 字符串，或确保 Chrome 以 --remote-debugging-port 启动")
+      throw new Error("请提供 Cookie 字符串，或确保 Chrome 开启了远程调试 (chrome://inspect/#remote-debugging)")
     }
   }
 

@@ -1,10 +1,120 @@
 // Find and start a Chromium-family browser on macOS, Windows or Linux.
 import { spawn } from "node:child_process"
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readlinkSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync } from "node:fs"
 import { rm } from "node:fs/promises"
 import { createServer } from "node:net"
+import os from "node:os"
 import path from "node:path"
 import { CDP, httpJSON } from "./cdp.mjs"
+
+export function devToolsActivePortCandidates(platform = process.platform, env = process.env) {
+  if (platform === "darwin") {
+    const home = env.HOME || os.homedir()
+    return [
+      ["Google", "Chrome"],
+      ["Google", "Chrome Beta"],
+      ["Microsoft Edge"],
+      ["Chromium"],
+      ["BraveSoftware", "Brave-Browser"],
+    ].map((segs) => path.posix.join(home, "Library", "Application Support", ...segs, "DevToolsActivePort"))
+  }
+  if (platform === "win32") {
+    const base = env.LOCALAPPDATA || ""
+    if (!base) return []
+    return [
+      ["Google", "Chrome", "User Data"],
+      ["Google", "Chrome Beta", "User Data"],
+      ["Microsoft", "Edge", "User Data"],
+      ["Chromium", "User Data"],
+      ["BraveSoftware", "Brave-Browser", "User Data"],
+    ].map((segs) => path.win32.join(base, ...segs, "DevToolsActivePort"))
+  }
+  const cfg = env.XDG_CONFIG_HOME || path.posix.join(env.HOME || os.homedir(), ".config")
+  return ["google-chrome", "google-chrome-beta", "microsoft-edge", "chromium", "brave-browser"]
+    .map((dir) => path.posix.join(cfg, dir, "DevToolsActivePort"))
+}
+
+export function parseDevToolsActivePort(content) {
+  const lines = String(content || "").trim().split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
+  if (lines.length < 2) return null
+  const port = Number(lines[0])
+  const wsPath = lines[1]
+  if (!Number.isInteger(port) || port <= 0 || !wsPath.startsWith("/")) return null
+  return { port, wsPath, wsUrl: `ws://127.0.0.1:${port}${wsPath}` }
+}
+
+async function connectAndVerifyCDP(wsUrl, port, source) {
+  const browser = await CDP.connect(wsUrl, { connectTimeoutMs: 15_000 })
+  try {
+    await browser.send("Browser.getVersion", {}, 5000)
+    return {
+      proc: null,
+      port,
+      browser,
+      profileDir: "",
+      existing: true,
+      source,
+      close: () => { browser.close() },
+    }
+  } catch (err) {
+    browser.close()
+    throw err
+  }
+}
+
+export async function findExistingBrowser({
+  connectPort = null,
+  env = process.env,
+  platform = process.platform,
+  exists = existsSync,
+  readFile = readFileSync,
+  log = () => {},
+} = {}) {
+  const files = devToolsActivePortCandidates(platform, env)
+  if (connectPort) {
+    const port = Number(connectPort)
+    try {
+      const v = await httpJSON(`http://127.0.0.1:${port}/json/version`, 2000)
+      if (v?.webSocketDebuggerUrl) return await connectAndVerifyCDP(v.webSocketDebuggerUrl, port, `port:${port}`)
+    } catch {}
+    for (const file of files) {
+      if (!exists(file)) continue
+      try {
+        const parsed = parseDevToolsActivePort(readFile(file, "utf8"))
+        if (parsed && parsed.port === port) {
+          return await connectAndVerifyCDP(parsed.wsUrl, parsed.port, `DevToolsActivePort:${port}`)
+        }
+      } catch (err) {
+        log(`autoConnect ${file} failed: ${err?.message || err}`)
+      }
+    }
+    throw new Error(`Cannot connect to existing browser on port ${connectPort}`)
+  }
+
+  for (const file of files) {
+    if (!exists(file)) continue
+    try {
+      const parsed = parseDevToolsActivePort(readFile(file, "utf8"))
+      if (!parsed) {
+        log(`autoConnect invalid ${file}`)
+        continue
+      }
+      log(`autoConnect trying ${parsed.wsUrl}`)
+      return await connectAndVerifyCDP(parsed.wsUrl, parsed.port, `DevToolsActivePort:${parsed.port}`)
+    } catch (err) {
+      log(`autoConnect ${file} failed: ${err?.message || err}`)
+    }
+  }
+
+  for (const port of [9222]) {
+    try {
+      const v = await httpJSON(`http://127.0.0.1:${port}/json/version`, 1200)
+      if (v?.webSocketDebuggerUrl) return await connectAndVerifyCDP(v.webSocketDebuggerUrl, port, `port:${port}`)
+    } catch {}
+  }
+  log(`autoConnect none found (LOCALAPPDATA=${env.LOCALAPPDATA ? "set" : "unset"})`)
+  return null
+}
 
 export function browserCandidates(platform = process.platform, env = process.env) {
   if (platform === "darwin") {
@@ -123,12 +233,15 @@ export async function launchBrowser({
   port,
   waitMs = 30_000,
   connectPort = null,
+  autoConnect = false,
+  log = () => {},
 }) {
   if (connectPort) {
-    const v = await httpJSON(`http://127.0.0.1:${connectPort}/json/version`, 3000)
-    if (!v?.webSocketDebuggerUrl) throw new Error(`Cannot connect to existing browser on port ${connectPort}`)
-    const browser = await CDP.connect(v.webSocketDebuggerUrl)
-    return { proc: null, port: connectPort, browser, profileDir: "", close: () => { browser.close() } }
+    return await findExistingBrowser({ connectPort, log })
+  }
+  if (autoConnect) {
+    const existing = await findExistingBrowser({ log }).catch(() => null)
+    if (existing) return existing
   }
 
   if (!executable) throw new Error("没找到 Chrome、Edge 或 Chromium；装一个，或用 HARK_WEB_CHROME 指定路径")

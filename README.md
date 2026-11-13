@@ -98,11 +98,26 @@ Hark 网页本身没有开放函数调用接口，插件采用提示词映射机
 - **周期额度池**：当前订阅周期内的 Token 用量与周期重置时间。
 - **方案类型**：显示当前账号对应的会员方案（如 Hark Pro）。
 
+## 复用日常 Chrome（推荐，不新开第二个 Chrome 进程）
+
+本插件默认会在每次发送请求时自动探测并复用你**平时正在使用的 Chrome / Edge / Chromium / Brave**（后台静默标签页，不会弹窗、也不会关闭你的浏览器）。
+
+### 如何让平时用的 Chrome 支持自动复用（仅需一次设置）
+
+1. 在你平时使用的 Chrome 地址栏打开：`chrome://inspect/#remote-debugging`
+2. 勾选 / 开启 **“允许远程调试”（Allow remote debugging）**
+3. 首次有请求连接时，Chrome 会在浏览器窗口弹出 **“允许远程调试？（Allow remote debugging?）”** 安全确认框，点击 **允许（Allow）** 即可（超时约 15 秒；点击后插件会保持连接复用，不需要每次请求都再开新进程或反复确认）
+
+> 提示：
+> - 如果弹窗未及时确认超时，或者 Chrome 未开启远程调试，插件会自动回退到内置的隐藏浏览器模式，不会报错阻塞。
+> - 多账号场景下，主账号会直接复用你当前 Chrome 的上下文；如果同一个引擎里同时有不同账号，其余账号会自动使用独立上下文以避免串号。
+
 ## 环境变量配置（可选）
 
 - `HARK_WEB_ENGINE_PORT`：自定义本地引擎监听端口（默认 `18622`）
+- `HARK_WEB_REUSE_CHROME`：是否自动探测并复用已运行的 Chrome（默认开启；设为 `0` 禁用，强制使用独立浏览器进程）
 - `HARK_WEB_CHROME`：指定 Chrome 可执行文件路径
-- `HARK_WEB_CHROME_PORT`：指定已运行 Chrome 的 CDP 调试端口
-- `HARK_WEB_BROWSER`：浏览器运行模式，可选 `hidden`（默认后台隐藏窗口，推荐）、`headless`（无头模式）、`show`（显示窗口）
+- `HARK_WEB_CHROME_PORT`：指定已运行 Chrome 的 CDP 调试端口（会自动尝试 `/json/version` 与 `DevToolsActivePort`）
+- `HARK_WEB_BROWSER`：当回退到独立浏览器时的运行模式，可选 `hidden`（默认后台隐藏窗口，推荐）、`headless`（无头模式）、`show`（显示窗口）
 - `HARK_WEB_PROXY`：指定代理地址（如 `http://127.0.0.1:7890`，或设为 `direct` 直连）
-- `HARK_WEB_IDLE_MIN`：闲置多长时间自动释放后台浏览器进程以节省内存（默认 60 分钟）
+- `HARK_WEB_IDLE_MIN`：闲置多长时间自动释放后台标签页/浏览器（默认 60 分钟）

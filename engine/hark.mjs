@@ -1,6 +1,4 @@
 // Drives hark.com's web chat for one named account at a time per page.
-import { randomUUID } from "node:crypto"
-import { CDP } from "./cdp.mjs"
 import { launchBrowser } from "./browser.mjs"
 
 export const ESSENTIAL = ["__Secure-hark.session_token"]
@@ -253,26 +251,32 @@ export class Hark {
     hidden = false,
     proxy = "",
     connectPort = null,
+    autoConnect = true,
     fetchImpl = fetch,
     firstTokenMs = 90_000,
     chatTimeoutMs = 300_000,
     loadMs = 30_000,
     onCookies = () => {},
     onLost = () => {},
+    onConnect = () => {},
+    onLog = () => {},
   }) {
     this.site = site.replace(/\/+$/, "")
     this.host = new URL(this.site).hostname
-    this.opts = { executable, profileDir, headless, hidden, proxy, connectPort }
+    this.opts = { executable, profileDir, headless, hidden, proxy, connectPort, autoConnect }
     this.fetchImpl = fetchImpl
     this.firstTokenMs = firstTokenMs
     this.chatTimeoutMs = chatTimeoutMs
     this.loadMs = loadMs
     this.onCookies = onCookies
     this.onLost = onLost
+    this.onConnect = onConnect
+    this.onLog = onLog
     this.accounts = new Map()
     this.usage = new Map()
     this.reading = new Map()
     this.started = null
+    this.defaultOwner = null
   }
 
   usageOf(accountId) {
@@ -285,7 +289,18 @@ export class Hark {
     if (this.reading.has(account.id)) return this.reading.get(account.id)
     const run = (async () => {
       try {
-        const summary = await fetchBillingSummary(this.site, account.cookies, { fetchImpl: this.fetchImpl })
+        let summary = await fetchBillingSummary(this.site, account.cookies, { fetchImpl: this.fetchImpl })
+        if (!summary) {
+          const a = this.accounts.get(account.id)
+          if (a?.home?.page && !a.home.page.closed) {
+            summary = await a.home.page
+              .js(`fetch('/api/billing/summary').then(function(r){return r.ok?r.json():null}).catch(function(){return null})`, {
+                awaitPromise: true,
+                timeoutMs: 10_000,
+              })
+              .catch(() => null)
+          }
+        }
         if (summary) {
           const card = { at: Date.now(), user: account.label || "", ...usageCard(summary) }
           this.usage.set(account.id, card)
@@ -300,31 +315,61 @@ export class Hark {
 
   async start() {
     if (this.started) return this.started
-    this.started = (async () => {
-      const b = await launchBrowser({
-        executable: this.opts.executable,
-        profileDir: this.opts.profileDir,
-        headless: this.opts.headless,
-        hidden: this.opts.hidden,
-        proxy: this.opts.proxy,
-        connectPort: this.opts.connectPort,
-      })
-      b.browser.onClose(() => {
-        this.started = null
-        this.accounts.clear()
-        this.onLost("closed")
-      })
-      return b
-    })()
-    return this.started
+    const starting = launchBrowser({
+      executable: this.opts.executable,
+      profileDir: this.opts.profileDir,
+      headless: this.opts.headless,
+      hidden: this.opts.hidden,
+      proxy: this.opts.proxy,
+      connectPort: this.opts.connectPort,
+      autoConnect: this.opts.autoConnect,
+      log: this.onLog,
+    }).then(
+      (b) => {
+        b.browser.onClose(() => {
+          if (this.started !== starting) return
+          this.started = null
+          this.defaultOwner = null
+          this.accounts.clear()
+          this.onLost("closed")
+        })
+        this.onConnect(b)
+        return b
+      },
+      (err) => {
+        if (this.started === starting) this.started = null
+        throw err
+      },
+    )
+    this.started = starting
+    return starting
   }
 
   async close() {
     const s = this.started
     this.started = null
+    this.defaultOwner = null
     if (!s) return
     const b = await s.catch(() => null)
-    await b?.close()
+    if (b) {
+      for (const a of this.accounts.values()) {
+        if (a.home) {
+          a.home.page.close()
+          if (b.existing) {
+            await b.browser.send("Target.closeTarget", { targetId: a.home.targetId }).catch(() => {})
+          }
+          a.home = null
+        }
+        if (a.contextId && b.existing) {
+          await b.browser.send("Target.disposeBrowserContext", { browserContextId: a.contextId }).catch(() => {})
+          a.contextId = null
+        }
+      }
+      this.accounts.clear()
+      await b.close()
+    } else {
+      this.accounts.clear()
+    }
   }
 
   acct(accountId) {
@@ -339,15 +384,22 @@ export class Hark {
   async closeAccount(accountId) {
     const a = this.accounts.get(accountId)
     if (!a) return
+    const running = await this.started?.catch(() => null)
     if (a.home) {
+      const targetId = a.home.targetId
       a.home.page.close()
       a.home = null
+      if (running) {
+        await running.browser.send("Target.closeTarget", { targetId }).catch(() => {})
+      }
     }
     if (a.contextId) {
-      const { browser } = await this.start()
-      await browser.send("Target.disposeBrowserContext", { browserContextId: a.contextId }).catch(() => {})
+      if (running) {
+        await running.browser.send("Target.disposeBrowserContext", { browserContextId: a.contextId }).catch(() => {})
+      }
       a.contextId = null
     }
+    if (this.defaultOwner === accountId) this.defaultOwner = null
   }
 
   async setCookies(browser, contextId, cookies, expires) {
@@ -359,56 +411,129 @@ export class Hark {
       const at = Number.isFinite(e) && e > now + 3600 ? e : now + 30 * 86400
       for (const domain of [`.${this.host}`, this.host]) {
         await browser.send("Storage.setCookies", {
-          browserContextId: contextId,
+          ...(contextId ? { browserContextId: contextId } : {}),
           cookies: [{ name, value, domain, path: "/", secure, expires: at }],
         }).catch(() => {})
       }
     }
   }
 
+  async readSessionInPage(page) {
+    return await page
+      .js(`fetch('/api/auth/get-session').then(function(r){return r.ok?r.json():null}).catch(function(){return null})`, {
+        awaitPromise: true,
+        timeoutMs: 10_000,
+      })
+      .catch(() => null)
+  }
+
+  async syncCookiesFromPage(page, account) {
+    try {
+      const res = await page.send("Network.getCookies", { urls: [this.site] })
+      const cookies = { ...(account.cookies || {}) }
+      const exp = { ...(account.cookies_exp || {}) }
+      let changed = false
+      for (const c of res.cookies || []) {
+        if (c.name && c.value && cookies[c.name] !== c.value) {
+          cookies[c.name] = c.value
+          if (Number.isFinite(c.expires) && c.expires > 0) exp[c.name] = c.expires
+          changed = true
+        }
+      }
+      if (changed) this.onCookies(account.id, cookies, exp, account.userId)
+    } catch {}
+  }
+
   async ensurePage(account) {
     const a = this.acct(account.id)
-    const { browser, port } = await this.start()
-    if (!a.contextId) {
+    const { browser, existing } = await this.start()
+    if (a.home && !a.home.page.closed) return a.home
+
+    // Reuse default browser context when connected to the user's running Chrome if unassigned or matching owner,
+    // avoiding popping up a separate incognito window on the user's desktop.
+    const canUseDefault = existing && (!this.defaultOwner || this.defaultOwner === account.id) && !a.isolated
+    let useDefault = canUseDefault
+    if (!useDefault && !a.contextId) {
       const ctx = await browser.send("Target.createBrowserContext", { disposeOnDetach: false })
       a.contextId = ctx.browserContextId
       await this.setCookies(browser, a.contextId, account.cookies, account.cookies_exp)
     }
-    if (a.home && !a.home.page.closed) return a.home
 
-    const { targetId } = await browser.send("Target.createTarget", {
-      url: "about:blank",
-      browserContextId: a.contextId,
-    })
-    const page = await CDP.connect(`ws://127.0.0.1:${port}/devtools/page/${targetId}`, { timeoutMs: 180_000 })
-    await Promise.all([
-      page.send("Page.enable"),
-      page.send("Runtime.enable"),
-      page.send("Network.enable"),
-      page.send("Page.bringToFront"),
-    ])
+    const openTarget = async (contextId) => {
+      const { targetId } = await browser.send("Target.createTarget", {
+        url: "about:blank",
+        ...(contextId ? { browserContextId: contextId } : {}),
+        ...(existing ? { background: true } : {}),
+      })
+      const page = await browser.attach(targetId, { timeoutMs: 180_000 })
+      await Promise.all([
+        page.send("Page.enable"),
+        page.send("Runtime.enable"),
+        page.send("Network.enable"),
+        page.send("Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {}),
+        ...(existing ? [] : [page.send("Page.bringToFront").catch(() => {})]),
+      ])
+      return { page, targetId }
+    }
 
-    await page.send("Page.navigate", { url: `${this.site}/chat` })
+    let { page, targetId } = await openTarget(useDefault ? null : a.contextId)
 
-    const startWait = Date.now()
-    let ready = false
-    while (Date.now() - startWait < this.loadMs) {
-      const state = await page.js(READY_JS).catch(() => "")
-      if (state === "ready") {
-        ready = true
-        break
+    try {
+      await page.send("Page.navigate", { url: `${this.site}/chat` })
+
+      const waitReady = async () => {
+        const startWait = Date.now()
+        while (Date.now() - startWait < this.loadMs) {
+          const state = await page.js(READY_JS).catch(() => "")
+          if (state === "ready") return true
+          if (await page.js("window.location.pathname.startsWith('/login') || window.location.pathname.startsWith('/sign-in')").catch(() => false)) {
+            return false
+          }
+          await sleep(300)
+        }
+        return false
       }
-      await sleep(500)
-    }
 
-    if (!ready) {
-      const isSignedOut = await page.js(SIGNED_OUT_CHECK_JS).catch(() => false)
-      if (isSignedOut) throw new AuthError("检测到未登录状态，需要重新登录")
-      throw new GenerationError("Hark 页面加载超时（输入框未就绪）")
-    }
+      let ready = await waitReady()
 
-    a.home = { page, targetId }
-    return a.home
+      if (useDefault) {
+        const ses = ready ? await this.readSessionInPage(page) : null
+        const pageUid = ses?.user?.id || ""
+        if (ready && pageUid && account.userId && pageUid !== account.userId) {
+          // User's everyday Chrome is logged in as a different Hark account: isolate this account cleanly.
+          page.close()
+          await browser.send("Target.closeTarget", { targetId }).catch(() => {})
+          a.isolated = true
+          useDefault = false
+          const ctx = await browser.send("Target.createBrowserContext", { disposeOnDetach: false })
+          a.contextId = ctx.browserContextId
+          await this.setCookies(browser, a.contextId, account.cookies, account.cookies_exp)
+          ;({ page, targetId } = await openTarget(a.contextId))
+          await page.send("Page.navigate", { url: `${this.site}/chat` })
+          ready = await waitReady()
+        } else if (!ready || !pageUid) {
+          // Everyday Chrome wasn't logged in to Hark yet; inject stored account cookies and reload.
+          await this.setCookies(browser, null, account.cookies, account.cookies_exp)
+          await page.send("Page.navigate", { url: `${this.site}/chat` })
+          ready = await waitReady()
+        }
+      }
+
+      if (!ready) {
+        const isSignedOut = await page.js(SIGNED_OUT_CHECK_JS).catch(() => false)
+        if (isSignedOut) throw new AuthError("检测到未登录状态，需要重新登录")
+        throw new GenerationError("Hark 页面加载超时（输入框未就绪）")
+      }
+
+      if (useDefault) this.defaultOwner = account.id
+      await this.syncCookiesFromPage(page, account)
+      a.home = { page, targetId }
+      return a.home
+    } catch (err) {
+      page.close()
+      await browser.send("Target.closeTarget", { targetId }).catch(() => {})
+      throw err
+    }
   }
 
   async verify(account) {
