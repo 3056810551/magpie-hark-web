@@ -143,6 +143,7 @@ export function createServer({
 
     try {
       const fullReply = await hark.chatStream(acct, prompt.full, {
+        lastPrompt: prompt.last,
         signal: ac.signal,
         tools: payload.tools,
         toolChoice: payload.tool_choice,

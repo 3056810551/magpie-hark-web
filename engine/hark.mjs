@@ -141,6 +141,58 @@ const READY_JS = `(function(){
   return 'ready';
 })()`
 
+export const HARK_MAX_CHARS = 36_000
+
+export function fitWithinLimit(full, last = "", limit = HARK_MAX_CHARS) {
+  const f = String(full || "")
+  if (f.length <= limit) return f
+  const l = String(last || "").trim()
+  if (l && l.length < limit - 200) {
+    const budget = limit - l.length - 64
+    const head = budget > 200 ? `${f.slice(0, budget)}\n\n...(上下文过长已裁剪)...\n\n` : ""
+    return `${head}${l}`.slice(0, limit)
+  }
+  const headSize = Math.floor(limit * 0.3)
+  const tailSize = limit - headSize - 32
+  return `${f.slice(0, headSize)}\n\n...(中间超长内容已省略)...\n\n${f.slice(-tailSize)}`.slice(0, limit)
+}
+
+export function splitForInput(full, last = "", limit = HARK_MAX_CHARS) {
+  const f = String(full || "")
+  if (f.length <= limit) return { text: f, attachmentText: "" }
+  const lead = "请先完整阅读随附的 prompt-context.txt 文件（包含完整的系统设定、历史上下文与工具规范，严格按其中要求作答），并处理下面当前请求：\n\n"
+  const budget = Math.max(1000, limit - lead.length)
+  const l = String(last || "").trim()
+  const body = l
+    ? (l.length <= budget ? l : `...(完整内容见附件 prompt-context.txt)\n\n${l.slice(-(budget - 40))}`)
+    : `...(完整内容见附件 prompt-context.txt)\n\n${f.slice(-(budget - 40))}`
+  return {
+    text: `${lead}${body}`.slice(0, limit),
+    attachmentText: f,
+  }
+}
+
+const ATTACH_TEXT_JS = (filename, content) => `(function(name, txt){
+  var input = document.querySelector('input[type="file"]');
+  if (!input) return 'no-input';
+  var dt = new DataTransfer();
+  dt.items.add(new File([txt], name, { type: 'text/plain' }));
+  input.files = dt.files;
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+  return 'triggered';
+})(${JSON.stringify(filename)}, ${JSON.stringify(content)})`
+
+const ATTACH_STATUS_JS = `(function(){
+  var box = document.querySelector('._7ol3wd2, [data-composer-pill]') || document;
+  var err = box.querySelector('._7ol3wdl._7ol3wdm');
+  if (err && (err.innerText || '').trim()) return JSON.stringify({ state: 'error', error: err.innerText.trim() });
+  var card = box.querySelector('.espofy5');
+  var loader = box.querySelector('.espofy5 [data-circle-loader], ._7ol3wd2 [data-circle-loader]');
+  if (card && !loader) return JSON.stringify({ state: 'ready' });
+  if (card || loader) return JSON.stringify({ state: 'uploading' });
+  return JSON.stringify({ state: 'pending' });
+})()`
+
 const SETTER_JS = (text) => `(function(t){
   var ta = document.querySelector('textarea');
   if (!ta) return 0;
@@ -577,7 +629,24 @@ export class Hark {
     await this.ensurePage(account)
   }
 
-  async chatStream(account, prompt, { signal, onChunk, tools, toolChoice } = {}) {
+  async attachTextFile(page, content, filename = "prompt-context.txt") {
+    const res = await page.js(ATTACH_TEXT_JS(filename, content), { timeoutMs: 15_000 }).catch(() => "err")
+    if (res !== "triggered") return false
+    const deadline = Date.now() + 20_000
+    while (Date.now() < deadline) {
+      await sleep(250)
+      const raw = await page.js(ATTACH_STATUS_JS).catch(() => null)
+      if (!raw) continue
+      try {
+        const st = JSON.parse(raw)
+        if (st.state === "ready") return true
+        if (st.state === "error") return false
+      } catch {}
+    }
+    return false
+  }
+
+  async chatStream(account, prompt, { lastPrompt = "", signal, onChunk, tools, toolChoice } = {}) {
     const a = this.acct(account.id)
     if (a.busy) throw new GenerationError("账号正忙 (maxConcurrency: 1)")
     a.busy = true
@@ -589,6 +658,14 @@ export class Hark {
       const isSignedOut = await page.js(SIGNED_OUT_CHECK_JS).catch(() => false)
       if (isSignedOut) throw new AuthError("检测到未登录状态，需要重新登录")
 
+      // Handle Hark's 40,000-character textarea limit: attach full context as prompt-context.txt if needed
+      let composerText = prompt
+      const plan = splitForInput(prompt, lastPrompt)
+      if (plan.attachmentText) {
+        const ok = await this.attachTextFile(page, plan.attachmentText, "prompt-context.txt")
+        composerText = ok ? plan.text : fitWithinLimit(prompt, lastPrompt)
+      }
+
       // Snapshot existing bubble IDs before sending so previous turns never leak into this response
       let seenIds = []
       try {
@@ -598,7 +675,7 @@ export class Hark {
       } catch {}
 
       // Inject text into textarea
-      await page.js(SETTER_JS(prompt))
+      await page.js(SETTER_JS(composerText))
       await sleep(200)
 
       // Click send button

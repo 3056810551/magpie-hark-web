@@ -10,7 +10,7 @@ import { devToolsActivePortCandidates, findExistingBrowser, parseDevToolsActiveP
 import { CDP } from "../engine/cdp.mjs"
 import { buildPrompt } from "../engine/prompt.mjs"
 import { functions, parseCalls, toolsPrompt } from "../engine/tools.mjs"
-import { POLL_JS, expiryMs, parseSetCookies, settle, usageCard } from "../engine/hark.mjs"
+import { HARK_MAX_CHARS, POLL_JS, expiryMs, fitWithinLimit, parseSetCookies, settle, splitForInput, usageCard } from "../engine/hark.mjs"
 import { dataDir, engineKey, writePrivate } from "../engine/paths.mjs"
 import { Store, parseCookieString } from "../engine/store.mjs"
 import { VERSION } from "../engine/version.mjs"
@@ -382,4 +382,22 @@ test("hark: POLL_JS ignores prior-turn OK and joins multi-entry text + code card
   const done = runPoll(fullEntries, ["u1", "b1"], { stop: false })
   assert.equal(done.streaming, false)
   assert.equal(done.txt, "这是基础示例：\n\nLangChain\nfrom langchain_openai import ChatOpenAI")
+})
+
+test("hark: splitForInput and fitWithinLimit keep composer text below 40k limit", () => {
+  const small = splitForInput("hello", "hello")
+  assert.equal(small.text, "hello")
+  assert.equal(small.attachmentText, "")
+
+  const bigSys = "RULE: always start with OK.\n" + "X".repeat(50_000)
+  const full = `背景与任务设定：\n${bigSys}\n\n用户：\n写一段代码`
+  const plan = splitForInput(full, "写一段代码")
+  assert.ok(plan.text.length <= HARK_MAX_CHARS)
+  assert.ok(plan.text.includes("写一段代码"))
+  assert.ok(plan.text.includes("prompt-context.txt"))
+  assert.equal(plan.attachmentText, full)
+
+  const fitted = fitWithinLimit(full, "写一段代码", 1000)
+  assert.ok(fitted.length <= 1000)
+  assert.ok(fitted.includes("写一段代码"))
 })
